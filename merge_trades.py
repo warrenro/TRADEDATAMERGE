@@ -138,11 +138,29 @@ def main():
     """
     主執行函數，協調資料處理流程。
     """
-    # --- 檔案設定 ---
-    main_file = '2021-2025 交易明细 工作表1.csv'
-    records_file = '成交紀錄 2021-2025.csv'
-    output_file = '合併交易紀錄.csv'
-    # ----------------
+    import argparse
+
+    parser = argparse.ArgumentParser(description='合併交易明細與成交紀錄。')
+    parser.add_argument(
+        '--main-file', 
+        default='2021-2025 交易明细 工作表1.csv', 
+        help='主要的交易明細檔案路徑 (例如: 2021-2025 交易明细 工作表1.csv)'
+    )
+    parser.add_argument(
+        '--records-file', 
+        default='成交紀錄 2021-2025.csv', 
+        help='成交紀錄檔案路徑 (例如: 成交紀錄 2021-2025.csv)'
+    )
+    parser.add_argument(
+        '--output-file', 
+        default='2021_2025交易與成交合併交易檔.csv', 
+        help='合併後的輸出檔案路徑'
+    )
+    args = parser.parse_args()
+
+    main_file = args.main_file
+    records_file = args.records_file
+    output_file = args.output_file
 
     # 階段一
     df_main, df_records = prepare_data(main_file, records_file)
