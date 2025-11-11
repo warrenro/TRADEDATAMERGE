@@ -1,148 +1,159 @@
 import pandas as pd
-import numpy as np
 import uuid
 from tqdm import tqdm
 
-def clean_numeric(val):
-    """清理數值欄位，移除千位數逗號、引號和小數點"""
-    if isinstance(val, str):
-        # 移除千位數逗號和引號
-        val = val.replace(',', '').replace('"', '')
-        # 如果有小數點，只取整數部分
-        if '.' in val:
-            val = val.split('.')[0]
-        return int(val)
-    elif isinstance(val, float):
-        # 如果是浮點數，轉為整數
-        return int(val)
-    return val
+# 註冊 tqdm 到 pandas apply，以便在 apply 操作中顯示進度條
+tqdm.pandas()
 
-def generate_uuid():
-    """產生16碼UUID"""
-    return str(uuid.uuid4()).replace('-', '')[:16]
+def clean_numeric_column(series: pd.Series) -> pd.Series:
+    """
+    清理數值欄位，移除千分位逗號、引號，並轉換為整數。
+    - 移除千位數逗號和引號。
+    - 移除小數點及其後數字。
+    - 將無法轉換的錯誤值填充為0，最後轉換為64位元整數。
+    """
+    # 移除逗號和引號
+    cleaned_series = series.astype(str).str.replace(',', '', regex=False).str.replace('"', '', regex=False)
+    # 移除小數點及其後數字
+    numeric_series = pd.to_numeric(cleaned_series.str.split('.').str[0], errors='coerce').fillna(0).astype('int64')
+    return numeric_series
 
-def prepare_data():
-    """階段一：資料清洗與準備"""
-    print("開始資料準備階段...")
+def find_open_time(row: pd.Series, df_records: pd.DataFrame, search_range: int = 5) -> pd.Timestamp:
+    """
+    根據平倉紀錄的序號，在《成交紀錄》中查找對應的新倉時間。
+    查找範圍為平倉紀錄序號的「前後5筆」。
+    """
+    # 定義查找範圍
+    start_seq = max(0, row['序號'] - search_range)
+    # 根據 spec，查找範圍是平倉紀錄的「前後」，但新倉必定發生在平倉之前，
+    # 因此我們只查找序號比當前平倉紀錄小的紀錄。
+    end_seq = row['序號']
+
+    # 篩選出在序號範圍內的潛在開倉紀錄
+    potential_opens = df_records.iloc[start_seq:end_seq]
     
-    # 載入檔案
-    df_main = pd.read_csv('2021-2025 交易明细 工作表1.csv')
-    df_records = pd.read_csv('成交紀錄 2021-2025.csv')
-    
-    # 清理數值欄位
-    numeric_columns = ['新倉價', '平倉價', '平倉損益淨額', '成交價', '手續費', '交易稅']
-    for col in numeric_columns:
-        if col in df_records.columns:
-            df_records[col] = df_records[col].apply(clean_numeric)
+    # 從潛在紀錄中找到符合所有條件的開倉紀錄
+    matched_opens = potential_opens[
+        (potential_opens['商品名稱'] == row['商品名稱']) & (potential_opens['倉別'] == '新倉') & (potential_opens['成交價'] == row['新倉價'])
+    ]
+
+    if not matched_opens.empty:
+        # 如果找到多筆，返回時間最接近（即序號最大）的開倉紀錄的成交時間
+        return matched_opens.iloc[-1]['成交時間']
+
+    return pd.NaT
+
+def prepare_data(main_file: str, records_file: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    階段一：資料清洗與準備
+    """
+    print(">> 階段一：資料清洗與準備")
+    print("正在載入檔案...")
+    try:
+        df_main = pd.read_csv(main_file)
+        df_records = pd.read_csv(records_file)
+    except FileNotFoundError as e:
+        print(f"錯誤：找不到檔案 {e.filename}。請確認檔案名稱與路徑是否正確。")
+        return None, None
+
+    print("正在進行資料清理與型態轉換...")
+    price_cols_main = ['新倉價', '平倉價', '平倉損益淨額']
+    for col in price_cols_main:
         if col in df_main.columns:
-            df_main[col] = df_main[col].apply(clean_numeric)
-    
-    # 數值型態轉換
-    integer_columns = ['口數', '成交口數']
-    for col in integer_columns:
+            df_main[col] = clean_numeric_column(df_main[col])
+
+    price_cols_records = ['成交價', '手續費']
+    for col in price_cols_records:
         if col in df_records.columns:
-            df_records[col] = df_records[col].astype('int64')
-        if col in df_main.columns:
-            df_main[col] = df_main[col].astype('int64')
-    
-    # 時間轉換
-    df_records['成交時間'] = pd.to_datetime(df_records['成交時間'])
+            df_records[col] = clean_numeric_column(df_records[col])
+
     df_main['成交時間'] = pd.to_datetime(df_main['成交時間'])
-    
-    # 新增 UUID 欄位
-    df_records['UUID'] = [generate_uuid() for _ in range(len(df_records))]
-    
-    # 根據成交時間排序並新增序號
-    df_records = df_records.sort_values('成交時間').reset_index(drop=True)
-    df_records['序號'] = range(1, len(df_records) + 1)
-    
+    df_records['成交時間'] = pd.to_datetime(df_records['成交時間'])
+
+    df_main['口數'] = pd.to_numeric(df_main['口數'], errors='coerce').fillna(0).astype('int64')
+    df_records['成交口數'] = pd.to_numeric(df_records['成交口數'], errors='coerce').fillna(0).astype('int64')
+
+    print("正在為成交紀錄新增 UUID 與序號...")
+    df_records = df_records.sort_values(by='成交時間').reset_index(drop=True)
+    df_records['序號'] = df_records.index
+    df_records['UUID'] = [uuid.uuid4().hex[:16] for _ in range(len(df_records))]
+
     return df_main, df_records
 
-def find_opening_time(row, df_records):
-    """尋找新倉時間"""
-    # 取得目前記錄的序號
-    current_seq = df_records[
-        (df_records['商品名稱'] == row['商品名稱']) &
-        (df_records['成交時間'] == row['成交時間'])
-    ]['序號'].iloc[0]
-    
-    # 在前後5筆記錄中尋找符合條件的新倉記錄
-    mask = (
-        (df_records['倉別'] == '新倉') &
-        (df_records['商品名稱'] == row['商品名稱']) &
-        (df_records['成交價'] == row['新倉價']) &
-        (df_records['序號'].between(current_seq - 5, current_seq + 5))
-    )
-    
-    matches = df_records[mask].sort_values('成交時間')
-    return matches['成交時間'].iloc[0] if not matches.empty else pd.NaT
+def merge_and_find(df_main: pd.DataFrame, df_records: pd.DataFrame) -> pd.DataFrame:
+    """
+    階段二：兩階段合併與新倉時間查找
+    """
+    print("\n>> 階段二：兩階段合併與新倉時間查找")
 
-def merge_data(df_main, df_records):
-    """階段二：兩階段合併與新倉時間查找"""
-    print("開始執行合併階段...")
-    
-    # 步驟1：比對平倉交易
-    merged1 = pd.merge(
+    print("步驟 1: 正在比對平倉交易...")
+    merged_df = pd.merge(
         df_main,
-        df_records[df_records['倉別'] == '平倉'],
+        df_records,
         left_on=['成交時間', '平倉價', '商品名稱'],
         right_on=['成交時間', '成交價', '商品名稱'],
-        how='inner'
+        how='left'
     )
-    
-    # 步驟2：比對新倉交易
-    print("處理新倉時間配對...")
-    tqdm.pandas()
-    merged1['新倉時間'] = merged1.progress_apply(
-        lambda row: find_opening_time(row, df_records), axis=1
-    )
-    
-    return merged1
+    merged_df.drop(columns=['成交價', '成交口數', '手續費', '倉別'], inplace=True)
 
-def process_output(merged_data):
-    """階段三：結果輸出與最終型態調整"""
-    print("處理輸出資料...")
-    
-    # 選擇最終欄位
-    final_columns = [
-        '成交時間',
-        '新倉時間', 
-        '商品名稱',
-        '口數',
-        '新倉價',
-        '平倉價',
-        '平倉損益淨額'
+    unmatched_close_trades = merged_df['序號'].isna().sum()
+    if unmatched_close_trades > 0:
+        print(f"注意：有 {unmatched_close_trades} 筆平倉交易在《成交紀錄》中未找到對應紀錄，將被忽略。")
+    merged_df.dropna(subset=['序號'], inplace=True)
+    merged_df['序號'] = merged_df['序號'].astype(int)
+
+    print("步驟 2: 正在查找新倉時間 (可能需要一些時間)...")
+    merged_df['新倉時間'] = merged_df.progress_apply(
+        find_open_time,
+        axis=1,
+        df_records=df_records,
+        search_range=5
+    )
+    return merged_df
+
+def process_output(merged_df: pd.DataFrame, output_filename: str) -> None:
+    """
+    階段三：結果輸出與最終型態調整
+    """
+    print("\n>> 階段三：結果輸出與最終型態調整")
+
+    unmatched_open_trades = merged_df['新倉時間'].isna().sum()
+    if unmatched_open_trades > 0:
+        print(f"注意：有 {unmatched_open_trades} 筆交易未能成功匹配到新倉時間，將從最終結果中移除。")
+    final_df = merged_df.dropna(subset=['新倉時間'])
+
+    output_columns = [
+        '成交時間', '新倉時間', '商品名稱', '口數',
+        '新倉價', '平倉價', '平倉損益淨額', 'UUID'
     ]
-    
-    result = merged_data[final_columns].copy()
-    
-    # 篩選有新倉時間的記錄
-    result = result.dropna(subset=['新倉時間'])
-    
-    # 確保所有數值欄位為整數型態
-    numeric_columns = ['新倉價', '平倉價', '平倉損益淨額', '口數']
-    for col in numeric_columns:
-        result[col] = result[col].astype('int64')
-    
-    return result
+    final_df = final_df[output_columns]
+
+    print(f"正在將結果輸出至 {output_filename}...")
+    final_df.to_csv(output_filename, index=False, encoding='utf-8-sig')
+
+    print("\n處理完成！")
+    print(f"成功處理並輸出了 {len(final_df)} 筆紀錄。")
 
 def main():
-    print("開始處理資料...")
-    
-    # 執行階段一：資料準備
-    df_main, df_records = prepare_data()
-    
-    # 執行階段二：資料合併
-    merged_data = merge_data(df_main, df_records)
-    
-    # 執行階段三：結果處理
-    final_result = process_output(merged_data)
-    
-    # 輸出結果
+    """
+    主執行函數，協調資料處理流程。
+    """
+    # --- 檔案設定 ---
+    main_file = '2021-2025 交易明细 工作表1.csv'
+    records_file = '成交紀錄 2021-2025.csv'
     output_file = '合併交易紀錄.csv'
-    final_result.to_csv(output_file, index=False)
-    print(f"處理完成，輸出檔案：{output_file}")
-    print(f"共計 {len(final_result)} 筆配對成功的交易紀錄")
+    # ----------------
 
-if __name__ == "__main__":
+    # 階段一
+    df_main, df_records = prepare_data(main_file, records_file)
+    if df_main is None or df_records is None:
+        return
+
+    # 階段二
+    merged_data = merge_and_find(df_main, df_records)
+
+    # 階段三
+    process_output(merged_data, output_file)
+
+if __name__ == '__main__':
     main()
